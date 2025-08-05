@@ -3,10 +3,9 @@
 import { afterAll, beforeAll, it } from "bun:test";
 import path from "node:path";
 import { alchemy } from "../alchemy.ts";
-import { DOStateStore } from "../cloudflare/index.ts";
 import { Scope } from "../scope.ts";
-import type { StateStoreType } from "../state.ts";
 import { NoopTelemetryClient } from "../util/telemetry/index.ts";
+import type { TestOptions } from "./options.ts";
 
 /**
  * Extend the Alchemy interface to include test functionality
@@ -21,33 +20,6 @@ declare module "../alchemy.ts" {
  * Add test functionality to alchemy instance
  */
 alchemy.test = test;
-
-/**
- * Options for configuring test behavior
- */
-export interface TestOptions {
-  /**
-   * Whether to suppress logging output.
-   * @default false.
-   */
-  quiet?: boolean;
-
-  /**
-   * Password to use for test resources.
-   * @default "test-password".
-   */
-  password?: string;
-
-  /**
-   * Override the default state store for the test.
-   */
-  stateStore?: StateStoreType;
-
-  /**
-   * Prefix to use for the scope to isolate tests and environments.
-   */
-  prefix?: string;
-}
 
 /**
  * Test function type definition with overloads
@@ -120,13 +92,6 @@ export function test(meta: ImportMeta, defaultOptions?: TestOptions): test {
   defaultOptions = defaultOptions ?? {
     quiet: true,
   };
-  if (
-    defaultOptions.stateStore === undefined &&
-    // process.env.CI &&
-    process.env.ALCHEMY_STATE_STORE === "cloudflare"
-  ) {
-    defaultOptions.stateStore = (scope) => new DOStateStore(scope);
-  }
 
   // Add skipIf functionality
   test.skipIf = it.skipIf.bind(it);

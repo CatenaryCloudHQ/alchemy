@@ -2,6 +2,7 @@
 import sitemap from "@astrojs/sitemap";
 import starlight from "@astrojs/starlight";
 import { defineConfig } from "astro/config";
+import starlightBlog from "starlight-blog";
 // import theme from "starlight-nextjs-theme";
 // import theme from 'starlight-theme-flexoki';
 // import theme from 'starlight-theme-rapide';
@@ -33,20 +34,18 @@ export default defineConfig({
       head: [
         {
           tag: "script",
-          content: 'console.log("test script 1");',
-        },
-        {
-          tag: "script",
-          content: postHogScript
-            .replace(
-              "<POSTHOG_CLIENT_API_HOST>",
-              process.env.POSTHOG_CLIENT_API_HOST,
-            )
-            .replace("<POSTHOG_PROJECT_ID>", process.env.POSTHOG_PROJECT_ID),
-        },
-        {
-          tag: "script",
-          content: 'console.log("test script 2");',
+          content:
+            process.env.ENABLE_POSTHOG === "true"
+              ? postHogScript
+                  .replace(
+                    "<POSTHOG_CLIENT_API_HOST>",
+                    process.env.POSTHOG_CLIENT_API_HOST,
+                  )
+                  .replace(
+                    "<POSTHOG_PROJECT_ID>",
+                    process.env.POSTHOG_PROJECT_ID,
+                  )
+              : "",
         },
       ],
       logo: {
@@ -78,6 +77,7 @@ export default defineConfig({
       },
       components: {
         Hero: "./src/components/Hero.astro",
+        MarkdownContent: "./src/components/MarkdownContent.astro",
       },
       sidebar: [
         {
@@ -109,7 +109,21 @@ export default defineConfig({
           "github-dark-dimmed",
         ],
       },
-      plugins: [theme()],
+      plugins: [
+        theme({
+          nav: [
+            {
+              label: "Docs",
+              href: "/getting-started",
+            },
+            {
+              label: "Blog",
+              href: "/blog",
+            },
+          ],
+        }),
+        starlightBlog(),
+      ],
     }),
   ],
   trailingSlash: "ignore",

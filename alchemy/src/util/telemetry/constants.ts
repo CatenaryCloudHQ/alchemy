@@ -1,8 +1,6 @@
-import { createXdgAppPaths } from "../xdg-paths.js";
+import envPaths from "env-paths";
 
-const xdg = createXdgAppPaths("alchemy");
-
-export const CONFIG_DIR = xdg.config();
+export const CONFIG_DIR = envPaths("alchemy", { suffix: "" }).config;
 
 export const TELEMETRY_DISABLED =
   !!process.env.ALCHEMY_TELEMETRY_DISABLED || !!process.env.DO_NOT_TRACK;

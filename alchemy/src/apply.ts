@@ -1,5 +1,6 @@
 import { alchemy } from "./alchemy.ts";
 import { context } from "./context.ts";
+import { destroy, DestroyStrategy } from "./destroy.ts";
 import {
   PROVIDERS,
   ResourceFQN,
@@ -14,7 +15,6 @@ import {
 } from "./resource.ts";
 import { Scope, type PendingDeletions } from "./scope.ts";
 import { serialize } from "./serde.ts";
-import type { State } from "./state.ts";
 import { formatFQN } from "./util/cli.ts";
 import { logger } from "./util/logger.ts";
 import type { Telemetry } from "./util/telemetry/index.ts";
@@ -33,7 +33,14 @@ export function apply<Out extends Resource>(
   return _apply(resource, props, options);
 }
 
-export class ReplacedSignal extends Error {}
+export class ReplacedSignal extends Error {
+  public force: boolean;
+
+  constructor(force?: boolean) {
+    super();
+    this.force = force ?? false;
+  }
+}
 
 async function _apply<Out extends Resource>(
   resource: PendingResource<Out>,
@@ -45,9 +52,7 @@ async function _apply<Out extends Resource>(
   try {
     const quiet = props?.quiet ?? scope.quiet;
     await scope.init();
-    let state: State | undefined = (await scope.state.get(
-      resource[ResourceID],
-    ))!;
+    let state = await scope.state.get(resource[ResourceID]);
     const provider: Provider = PROVIDERS.get(resource[ResourceKind]);
     if (provider === undefined) {
       throw new Error(`Provider "${resource[ResourceKind]}" not found`);
@@ -84,6 +89,7 @@ async function _apply<Out extends Resource>(
           [ResourceKind]: resource[ResourceKind],
           [ResourceScope]: scope,
           [ResourceSeq]: resource[ResourceSeq],
+          [DestroyStrategy]: provider.options?.destroyStrategy ?? "sequential",
         },
         // deps: [...deps],
         props,
@@ -105,8 +111,14 @@ async function _apply<Out extends Resource>(
       });
       if (
         JSON.stringify(oldProps) === JSON.stringify(newProps) &&
-        alwaysUpdate !== true
+        alwaysUpdate !== true &&
+        !scope.force
       ) {
+        const innerScope = new Scope({
+          parent: scope,
+          scopeName: resource[ResourceID],
+        });
+        innerScope.skip();
         if (!quiet) {
           logger.task(resource[ResourceFQN], {
             prefix: "skipped",
@@ -116,12 +128,7 @@ async function _apply<Out extends Resource>(
             status: "success",
           });
         }
-        options?.resolveInnerScope?.(
-          new Scope({
-            parent: scope,
-            scopeName: resource[ResourceID],
-          }),
-        );
+        options?.resolveInnerScope?.(innerScope);
         scope.telemetryClient.record({
           event: "resource.skip",
           resource: resource[ResourceKind],
@@ -165,7 +172,7 @@ async function _apply<Out extends Resource>(
       props: state.oldProps,
       state,
       isReplacement: false,
-      replace: () => {
+      replace: (force?: boolean) => {
         if (phase === "create") {
           throw new Error(
             `Resource ${resource[ResourceKind]} ${resource[ResourceFQN]} cannot be replaced in create phase.`,
@@ -178,7 +185,7 @@ async function _apply<Out extends Resource>(
         }
 
         isReplaced = true;
-        throw new ReplacedSignal();
+        throw new ReplacedSignal(force);
       },
     });
 
@@ -189,6 +196,7 @@ async function _apply<Out extends Resource>(
         {
           isResource: true,
           parent: scope,
+          destroyStrategy: provider.options?.destroyStrategy ?? "sequential",
         },
         async (scope) => {
           options?.resolveInnerScope?.(scope);
@@ -203,6 +211,25 @@ async function _apply<Out extends Resource>(
           );
         }
 
+        if (error.force) {
+          await destroy(resource, {
+            quiet: scope.quiet,
+            strategy: resource[DestroyStrategy] ?? "sequential",
+            replace: {
+              props: state.oldProps,
+              output: oldOutput,
+            },
+          });
+        } else {
+          const pendingDeletions =
+            (await scope.get<PendingDeletions>("pendingDeletions")) ?? [];
+          pendingDeletions.push({
+            resource: oldOutput,
+            oldProps: state.oldProps,
+          });
+          await scope.set("pendingDeletions", pendingDeletions);
+        }
+
         output = await alchemy.run(
           resource[ResourceID],
           { isResource: true, parent: scope },
@@ -215,8 +242,8 @@ async function _apply<Out extends Resource>(
                 id: resource[ResourceID],
                 fqn: resource[ResourceFQN],
                 seq: resource[ResourceSeq],
-                props: state.props,
-                state,
+                props: state!.props,
+                state: state!,
                 isReplacement: true,
                 replace: () => {
                   throw new Error(
@@ -226,14 +253,6 @@ async function _apply<Out extends Resource>(
               }),
             )(resource[ResourceID], props),
         );
-
-        const pendingDeletions =
-          (await scope.get<PendingDeletions>("pendingDeletions")) ?? [];
-        pendingDeletions.push({
-          resource: oldOutput,
-          oldProps: state.oldProps,
-        });
-        await scope.set("pendingDeletions", pendingDeletions);
       } else {
         throw error;
       }
@@ -258,16 +277,16 @@ async function _apply<Out extends Resource>(
       replaced: isReplaced,
     });
 
+    state = await scope.state.get(resource[ResourceID]);
     await scope.state.set(resource[ResourceID], {
       kind: resource[ResourceKind],
       id: resource[ResourceID],
       fqn: resource[ResourceFQN],
       seq: resource[ResourceSeq],
-      data: state.data,
+      data: state?.data ?? {}, // TODO: this used to be force-unwrapped but that was crashing for me - is this change ok?
       status,
       output,
       props,
-      // deps: [...deps],
     });
     return output as any;
   } catch (error) {

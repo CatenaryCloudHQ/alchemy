@@ -1,16 +1,17 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { onExit } from "signal-exit";
 import { ReplacedSignal } from "./apply.ts";
-import { DestroyedSignal, destroy } from "./destroy.ts";
+import { DestroyStrategy, DestroyedSignal, destroy } from "./destroy.ts";
 import { env } from "./env.ts";
 import {
-  type PendingResource,
   ResourceFQN,
   ResourceID,
   ResourceKind,
   ResourceScope,
   ResourceSeq,
+  type PendingResource,
 } from "./resource.ts";
 import { isRuntime } from "./runtime/global.ts";
 import { DEFAULT_STAGE, Scope } from "./scope.ts";
@@ -19,48 +20,6 @@ import type { StateStoreType } from "./state.ts";
 import type { LoggerApi } from "./util/cli.ts";
 import { logger } from "./util/logger.ts";
 import { TelemetryClient } from "./util/telemetry/client.ts";
-
-/**
- * Parses CLI arguments to extract alchemy options
- */
-function parseCliArgs(): Partial<AlchemyOptions> {
-  const args = process.argv.slice(2);
-  const options: Partial<AlchemyOptions> = {};
-
-  // Parse phase from CLI arguments
-  if (args.includes("--destroy")) {
-    options.phase = "destroy";
-  } else if (args.includes("--read")) {
-    options.phase = "read";
-  }
-
-  if (
-    args.includes("--dev") ||
-    args.includes("--watch") ||
-    process.execArgv.includes("--watch")
-  ) {
-    options.dev = true;
-  }
-
-  // Parse quiet flag
-  if (args.includes("--quiet")) {
-    options.quiet = true;
-  }
-
-  // Parse stage argument (--stage my-stage)
-  const stageIndex = args.indexOf("--stage");
-  if (stageIndex !== -1 && stageIndex + 1 < args.length) {
-    options.stage = args[stageIndex + 1];
-  }
-  options.stage ??= process.env.STAGE;
-
-  // Get password from environment variables
-  if (process.env.ALCHEMY_PASSWORD) {
-    options.password = process.env.ALCHEMY_PASSWORD;
-  }
-
-  return options;
-}
 
 /**
  * Type alias for semantic highlighting of `alchemy` as a type keyword
@@ -173,8 +132,26 @@ async function _alchemy(
   if (typeof args[0] === "string") {
     const [appName, options] = args as [string, AlchemyOptions?];
 
-    // Parse CLI arguments and merge with provided options (explicit options take precedence)
-    const cliOptions = parseCliArgs();
+    const cliArgs = process.argv.slice(2);
+    const cliOptions = {
+      phase: cliArgs.includes("--destroy")
+        ? "destroy"
+        : cliArgs.includes("--read")
+          ? "read"
+          : "up",
+      local: cliArgs.includes("--local") || cliArgs.includes("--dev"),
+      watch: cliArgs.includes("--watch"),
+      quiet: cliArgs.includes("--quiet"),
+      force: cliArgs.includes("--force"),
+      // Parse stage argument (--stage my-stage) functionally and inline as a property declaration
+      stage: (function parseStage() {
+        const i = cliArgs.indexOf("--stage");
+        return i !== -1 && i + 1 < cliArgs.length
+          ? cliArgs[i + 1]
+          : process.env.STAGE;
+      })(),
+      password: process.env.ALCHEMY_PASSWORD,
+    } satisfies Partial<AlchemyOptions>;
     const mergedOptions = {
       ...cliOptions,
       ...options,
@@ -195,6 +172,12 @@ async function _alchemy(
       phase,
       password: mergedOptions?.password ?? process.env.ALCHEMY_PASSWORD,
       telemetryClient,
+    });
+    onExit((code) => {
+      root.cleanup().then(() => {
+        process.exit(code);
+      });
+      return true;
     });
     const stageName = mergedOptions?.stage ?? DEFAULT_STAGE;
     const stage = new Scope({
@@ -346,11 +329,23 @@ export interface AlchemyOptions {
    */
   phase?: Phase;
   /**
-   * Determines whether Alchemy will run in dev mode.
+   * Determines if resources should be simulated locally (where possible)
    *
-   * @default - `true` if `--dev` or `--watch` is passed as a CLI argument, `false` otherwise
+   * @default - `true` if ran with `alchemy dev` or `bun ./alchemy.run.ts --dev`
    */
-  dev?: boolean;
+  local?: boolean;
+  /**
+   * Determines if local changes to resources should be reactively pushed to the local or remote environment.
+   *
+   * @default - `true` if ran with `alchemy dev`, `alchemy watch`, `bun --watch ./alchemy.run.ts`
+   */
+  watch?: boolean;
+  /**
+   * Apply updates to resources even if there are no changes.
+   *
+   * @default false
+   */
+  force?: boolean;
   /**
    * Name to scope the resource state under (e.g. `.alchemy/{stage}/..`).
    *
@@ -371,6 +366,12 @@ export interface AlchemyOptions {
    * A custom scope to use as a parent.
    */
   parent?: Scope;
+  /**
+   * The strategy to use when destroying resources.
+   *
+   * @default "sequential"
+   */
+  destroyStrategy?: DestroyStrategy;
   /**
    * If true, will not print any Create/Update/Delete messages.
    *
@@ -463,6 +464,7 @@ async function run<T>(
         [ResourceKind]: Scope.KIND,
         [ResourceScope]: _scope,
         [ResourceSeq]: seq,
+        [DestroyStrategy]: options?.destroyStrategy ?? "sequential",
       } as const;
       const resource = {
         kind: Scope.KIND,

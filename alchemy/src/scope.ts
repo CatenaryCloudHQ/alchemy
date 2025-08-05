@@ -1,9 +1,8 @@
+import kleur from "kleur";
 import { AsyncLocalStorage } from "node:async_hooks";
 import util from "node:util";
 import type { Phase } from "./alchemy.ts";
-import { DOStateStore } from "./cloudflare/do-state-store/index.ts";
-import { destroy, destroyAll } from "./destroy.ts";
-import { FileSystemStateStore } from "./fs/file-system-state-store.ts";
+import { destroy, destroyAll, DestroyStrategy } from "./destroy.ts";
 import {
   ResourceFQN,
   ResourceID,
@@ -15,11 +14,15 @@ import {
   type ResourceProps,
 } from "./resource.ts";
 import type { State, StateStore, StateStoreType } from "./state.ts";
+import { D1StateStore } from "./state/d1-state-store.ts";
+import { FileSystemStateStore } from "./state/file-system-state-store.ts";
+import { InstrumentedStateStore } from "./state/instrumented-state-store.ts";
 import {
   createDummyLogger,
   createLoggerInstance,
   type LoggerApi,
 } from "./util/cli.ts";
+import { logger } from "./util/logger.ts";
 import { AsyncMutex } from "./util/mutex.ts";
 import type { ITelemetryClient } from "./util/telemetry/client.ts";
 
@@ -37,7 +40,30 @@ export interface ScopeOptions {
   stateStore?: StateStoreType;
   quiet?: boolean;
   phase?: Phase;
-  dev?: boolean;
+  /**
+   * Determines if resources should be simulated locally (where possible)
+   *
+   * @default - `true` if ran with `alchemy dev` or `bun ./alchemy.run.ts --dev`
+   */
+  local?: boolean;
+  /**
+   * Determines if local changes to resources should be reactively pushed to the local or remote environment.
+   *
+   * @default - `true` if ran with `alchemy dev`, `alchemy watch`, `bun --watch ./alchemy.run.ts`
+   */
+  watch?: boolean;
+  /**
+   * Apply updates to resources even if there are no changes.
+   *
+   * @default false
+   */
+  force?: boolean;
+  /**
+   * The strategy to use when destroying resources.
+   *
+   * @default "sequential"
+   */
+  destroyStrategy?: DestroyStrategy;
   telemetryClient?: ITelemetryClient;
   logger?: LoggerApi;
 }
@@ -106,16 +132,20 @@ export class Scope {
   public readonly stateStore: StateStoreType;
   public readonly quiet: boolean;
   public readonly phase: Phase;
-  public readonly dev?: boolean;
+  public readonly local: boolean;
+  public readonly watch: boolean;
+  public readonly force: boolean;
+  public readonly destroyStrategy: DestroyStrategy;
   public readonly logger: LoggerApi;
   public readonly telemetryClient: ITelemetryClient;
   public readonly dataMutex: AsyncMutex;
 
   private isErrored = false;
+  private isSkipped = false;
   private finalized = false;
   private startedAt = performance.now();
-
   private deferred: (() => Promise<any>)[] = [];
+  private cleanups: (() => Promise<void>)[] = [];
 
   public get appName(): string {
     if (this.parent) {
@@ -161,28 +191,40 @@ export class Scope {
           options.logger,
         );
 
-    this.dev = options.dev ?? this.parent?.dev ?? false;
-
-    if (this.dev) {
+    this.local = options.local ?? this.parent?.local ?? false;
+    this.watch = options.watch ?? this.parent?.watch ?? false;
+    this.force = options.force ?? this.parent?.force ?? false;
+    this.destroyStrategy =
+      options.destroyStrategy ?? this.parent?.destroyStrategy ?? "sequential";
+    if (this.local) {
       this.logger.warnOnce(
-        "Local development mode is in beta. Please report any issues to https://github.com/sam-goodwin/alchemy/issues.",
+        "Development mode is in beta. Please report any issues to https://github.com/sam-goodwin/alchemy/issues.",
       );
     }
 
     this.stateStore =
-      options.stateStore ??
-      this.parent?.stateStore ??
-      ((scope) =>
-        process.env.ALCHEMY_STATE_STORE === "cloudflare"
-          ? new DOStateStore(scope)
-          : new FileSystemStateStore(scope));
-    this.state = this.stateStore(this);
+      options.stateStore ?? this.parent?.stateStore ?? defaultStateStore;
+    this.telemetryClient =
+      options.telemetryClient ?? this.parent?.telemetryClient!;
+    this.state = new InstrumentedStateStore(
+      this.stateStore(this),
+      this.telemetryClient,
+    );
     if (!options.telemetryClient && !this.parent?.telemetryClient) {
       throw new Error("Telemetry client is required");
     }
-    this.telemetryClient =
-      options.telemetryClient ?? this.parent?.telemetryClient!;
     this.dataMutex = new AsyncMutex();
+  }
+
+  /**
+   * @internal
+   */
+  public clear() {
+    for (const child of this.children.values()) {
+      child.clear();
+    }
+    this.resources.clear();
+    this.children.clear();
   }
 
   public get root(): Scope {
@@ -205,11 +247,23 @@ export class Scope {
   }
 
   public get chain(): string[] {
+    // Since the root scope name is the same as the app name, this ensures
+    // the root scope chain is "<app-name>" instead of "<app-name>/<app-name>".
+    if (
+      !this.parent &&
+      this.appName &&
+      this.scopeName &&
+      this.appName === this.scopeName
+    ) {
+      return [this.appName];
+    }
+
     const thisScope = this.scopeName ? [this.scopeName] : [];
-    const app = this.appName ? [this.appName] : [];
     if (this.parent) {
       return [...this.parent.chain, ...thisScope];
     }
+
+    const app = this.appName ? [this.appName] : [];
     return [...app, ...thisScope];
   }
 
@@ -218,8 +272,17 @@ export class Scope {
     this.isErrored = true;
   }
 
+  public skip() {
+    this.isSkipped = true;
+  }
+
   public async init() {
-    await Promise.all([this.state.init?.(), this.telemetryClient.ready]);
+    await Promise.all([
+      this.state.init?.(),
+      this.telemetryClient.ready.catch((error) => {
+        this.logger.warn("Telemetry initialization failed:", error);
+      }),
+    ]);
   }
 
   public async deinit() {
@@ -272,6 +335,7 @@ export class Scope {
                 [ResourceKind]: "alchemy::Scope",
                 [ResourceScope]: this,
                 [ResourceSeq]: this.seq(),
+                [DestroyStrategy]: this.destroyStrategy,
               },
               props: {},
             }
@@ -286,13 +350,13 @@ export class Scope {
   }
 
   public async set<T>(key: string, value: T): Promise<void> {
-    return this.withScopeState<void>(async (state, persist) => {
+    await this.withScopeState<void>(async (state, persist) => {
       state.data[key] = value;
       await persist(state); // only one line to save!
     });
   }
 
-  public async get<T>(key: string): Promise<T> {
+  public get<T>(key: string): Promise<T> {
     return this.withScopeState<T>(async (state) => state.data[key]);
   }
 
@@ -352,7 +416,7 @@ export class Scope {
     this.finalized = true;
     // trigger and await all deferred promises
     await Promise.all(this.deferred.map((fn) => fn()));
-    if (!this.isErrored) {
+    if (!this.isErrored && !this.isSkipped) {
       // TODO: need to detect if it is in error
       const resourceIds = await this.state.list();
       const aliveIds = new Set(this.resources.keys());
@@ -383,14 +447,14 @@ export class Scope {
       );
       await destroyAll(orphans, {
         quiet: this.quiet,
-        strategy: "sequential",
+        strategy: this.destroyStrategy,
         force: shouldForce,
       });
       this.rootTelemetryClient?.record({
         event: "app.success",
         elapsed: performance.now() - this.startedAt,
       });
-    } else {
+    } else if (this.isErrored) {
       this.logger.warn("Scope is in error, skipping finalize");
       this.rootTelemetryClient?.record({
         event: "app.error",
@@ -399,7 +463,14 @@ export class Scope {
       });
     }
 
-    await this.rootTelemetryClient?.finalize();
+    await this.rootTelemetryClient?.finalize()?.catch((error) => {
+      this.logger.warn("Telemetry finalization failed:", error);
+    });
+
+    if (!this.parent && process.env.ALCHEMY_TEST_KILL_ON_FINALIZE) {
+      await this.cleanup();
+      process.exit(0);
+    }
   }
 
   public async destroyPendingDeletions() {
@@ -410,11 +481,21 @@ export class Scope {
         }
         throw e;
       })) ?? [];
+
+    //todo(michael): remove once we deprecate doss; see: https://github.com/sam-goodwin/alchemy/issues/585
+    let hasCorruptedResources = false;
     if (pendingDeletions) {
       for (const { resource, oldProps } of pendingDeletions) {
         //todo(michael): ugly hack due to the way scope is serialized
         const realResource = this.resources.get(resource[ResourceID])!;
         resource[ResourceScope] = realResource?.[ResourceScope] ?? this;
+        if (realResource == null && resource[ResourceID] == null) {
+          logger.warn(
+            "A replaced resource pending deletion is corrupted and will NOT be deleted. This is likely a bug with the state store.",
+          );
+          hasCorruptedResources = true;
+          continue;
+        }
         await destroy(resource, {
           quiet: this.quiet,
           strategy: "sequential",
@@ -424,6 +505,16 @@ export class Scope {
           },
         });
       }
+    }
+    if (hasCorruptedResources) {
+      const newPendingDeletions =
+        (await this.get<PendingDeletions>("pendingDeletions").catch(
+          () => [],
+        )) ?? [];
+      await this.set(
+        "pendingDeletions",
+        newPendingDeletions.filter((d) => d.resource[ResourceID] != null),
+      );
     }
   }
 
@@ -450,6 +541,28 @@ export class Scope {
   }
 
   /**
+   * Run all cleanup functions registered with `onCleanup`.
+   * This should only be called on the root scope.
+   */
+  public async cleanup() {
+    if (this.parent || this.cleanups.length === 0) return;
+    this.logger.log(kleur.gray("Exiting..."));
+    await Promise.allSettled(this.cleanups.map((cleanup) => cleanup()));
+  }
+
+  /**
+   * Register a cleanup function that will be called when the process exits.
+   * This should only be called on the root scope.
+   */
+  public onCleanup(fn: () => Promise<void>) {
+    if (this.parent) {
+      this.root.onCleanup(fn);
+      return;
+    }
+    this.cleanups.push(fn);
+  }
+
+  /**
    * Returns a string representation of the scope.
    */
   public toString() {
@@ -461,6 +574,15 @@ export class Scope {
 )`;
   }
 }
+
+const defaultStateStore: StateStoreType = (scope: Scope) => {
+  switch (process.env.ALCHEMY_STATE_STORE) {
+    case "d1":
+      return new D1StateStore(scope);
+    default:
+      return new FileSystemStateStore(scope);
+  }
+};
 
 declare global {
   // for runtime

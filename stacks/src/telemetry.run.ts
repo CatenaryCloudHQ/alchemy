@@ -1,10 +1,11 @@
 import alchemy from "alchemy";
-import { DOStateStore, Pipeline, R2Bucket } from "alchemy/cloudflare";
+import { Pipeline, R2Bucket } from "alchemy/cloudflare";
+import { CloudflareStateStore } from "alchemy/state";
 import env from "./env.ts";
 
 const app = await alchemy("alchemy:telemetry", {
   ...env,
-  stateStore: (scope) => new DOStateStore(scope),
+  stateStore: (scope) => new CloudflareStateStore(scope),
 });
 
 const bucket = await R2Bucket("telemetry-bucket", {
@@ -21,8 +22,8 @@ const pipeline = await Pipeline("telemetry-pipeline", {
       bucket: bucket.name,
     },
     credentials: {
-      accessKeyId: await alchemy.secret.env.R2_ACCESS_KEY_ID,
-      secretAccessKey: await alchemy.secret.env.R2_SECRET_ACCESS_KEY,
+      accessKeyId: alchemy.secret.env.R2_ACCESS_KEY_ID,
+      secretAccessKey: alchemy.secret.env.R2_SECRET_ACCESS_KEY,
     },
   },
 });

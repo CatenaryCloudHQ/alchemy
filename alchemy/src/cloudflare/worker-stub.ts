@@ -2,12 +2,13 @@ import type { Context } from "../context.ts";
 import { Resource, ResourceKind } from "../resource.ts";
 import type { type } from "../type.ts";
 import { handleApiError } from "./api-error.ts";
+import { extractCloudflareResult } from "./api-response.ts";
 import {
   createCloudflareApi,
   type CloudflareApi,
   type CloudflareApiOptions,
 } from "./api.ts";
-import { configureURL } from "./worker.ts";
+import { WorkerSubdomain } from "./worker-subdomain.ts";
 
 /**
  * Properties for creating a Worker stub
@@ -109,15 +110,20 @@ export const WorkerStub = Resource("cloudflare::WorkerStub", async function <
   }
 
   // Configure URL if requested (defaults to true)
-  const enableUrl = props.url ?? true;
-  const workerUrl = await configureURL(this, api, props.name, enableUrl);
+  const subdomain =
+    props.url !== false
+      ? await WorkerSubdomain("url", {
+          ...props,
+          scriptName: props.name,
+        })
+      : undefined;
 
   // Return the worker stub info
   return this({
     type: "service",
     __rpc__: props.rpc as unknown as RPC,
     ...props,
-    url: workerUrl,
+    url: subdomain?.url,
   }) as WorkerStub<RPC>;
 });
 
@@ -180,20 +186,16 @@ async function createEmptyWorker(
   );
 
   // Upload worker script
-  const uploadResponse = await api.put(
-    `/accounts/${api.accountId}/workers/scripts/${workerName}`,
-    formData,
-    {
-      headers: {
-        "Content-Type": "multipart/form-data",
+  await extractCloudflareResult(
+    `create empty worker "${workerName}"`,
+    api.put(
+      `/accounts/${api.accountId}/workers/scripts/${workerName}`,
+      formData,
+      {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
       },
-    },
+    ),
   );
-
-  // Check if the upload was successful
-  if (!uploadResponse.ok) {
-    throw new Error(
-      `Failed to create empty worker: ${uploadResponse.status} ${uploadResponse.statusText}`,
-    );
-  }
 }
